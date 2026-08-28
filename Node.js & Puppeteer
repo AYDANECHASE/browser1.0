@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Virtual Browser Client</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #222; color: #fff; text-align: center; margin: 0; padding: 10px; }
+        #navbar { margin-bottom: 10px; display: flex; justify-content: center; gap: 10px; }
+        #urlInput { width: 50%; padding: 8px; border-radius: 4px; border: none; }
+        button { padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; background: #007bff; color: white; }
+        #browser-viewport { border: 2px solid #555; background: #000; cursor: crosshair; max-width: 100%; display: block; margin: 0 auto; }
+    </style>
+</head>
+<body>
+
+    <div id="navbar">
+        <input type="text" id="urlInput" placeholder="Enter URL (e.g., wikipedia.org)">
+        <button onclick="navigate()">Go</button>
+    </div>
+
+    <canvas id="browser-viewport" width="1280" height="720"></canvas>
+
+    <script>
+        const canvas = document.getElementById('browser-viewport');
+        const ctx = canvas.getContext('2d');
+        const urlInput = document.getElementById('urlInput');
+        
+        // Establish WebSocket connection to the Node.js server
+        const ws = new WebSocket(`ws://${window.location.host}`);
+        ws.binaryType = 'blob';
+
+        // Render binary images received from server onto the canvas
+        ws.onmessage = (event) => {
+            if (event.data instanceof Blob) {
+                const img = new Image();
+                img.onload = () => {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(img, 0, 0);
+                };
+                img.src = URL.createObjectURL(event.data);
+            }
+        };
+
+        // Capture local mouse clicks and send coordinates to the remote browser
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            // Scale click coordinates relative to the 1280x720 canvas resolution
+            const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+            
+            ws.send(JSON.stringify({ type: 'click', x: Math.round(x), y: Math.round(y) }));
+        });
+
+        // Capture local keystrokes and pass them to the remote browser
+        window.addEventListener('keydown', (e) => {
+            // Ignore system keys or input box focus
+            if (document.activeElement === urlInput || e.key.length > 1) return;
+            ws.send(JSON.stringify({ type: 'type', key: e.key }));
+        });
+
+        // Trigger navigation function
+        function navigate() {
+            const url = urlInput.value.trim();
+            if (url) {
+                ws.send(JSON.stringify({ type: 'navigate', url: url }));
+            }
+        }
+    </script>
+</body>
+</html>
+
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const puppeteer = require('puppeteer');
+const path = require('path');
+const crypto = require('crypto');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Active sessions registry
+const activeSessions = new Map();
+
+wss.on('connection', async (ws) => {
+
+    // Generate a unique identifier for the user session
+    const sessionId = crypto.randomUUID();
+    console.log(`User connected. Created session: ${sessionId}`);
+
+    try {
+        // Launch a dedicated browser and page instance for this user
+        const browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 720 });
+        await page.goto('https://google.com');
+
+        // Frame rendering loops per session
+        const streamInterval = setInterval(async () => {
+            if (ws.readyState === WebSocket.OPEN) {
+                try {
+                    const screenshot = await page.screenshot({ type: 'jpeg', quality: 55 });
+                    ws.send(screenshot);
+                } catch (err) {
+                    // Fail silently if page closes during capture
+                }
+            }
+        }, 110); // ~9 Frames Per Second to manage CPU across threads
+
+        // Save session references
+        activeSessions.set(sessionId, { browser, page, streamInterval });
+
+    } catch (err) {
+        console.error(`Initialization failed for session ${sessionId}:`, err);
+        ws.close();
+        return;
+    }
+
+    // Process isolated client interactions
+    ws.on('message', async (message) => {
+        const session = activeSessions.get(sessionId);
+        if (!session) return;
+
+        try {
+            const data = JSON.parse(message);
+            if (data.type === 'click') {
+                await session.page.mouse.click(data.x, data.y);
+            } 
+            else if (data.type === 'type') {
+                await session.page.keyboard.sendCharacter(data.key);
+            } 
+            else if (data.type === 'navigate') {
+                let url = data.url;
+                if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+                await session.page.goto(url);
+            }
+        } catch (err) {
+            console.error(`Interaction error in session ${sessionId}:`, err);
+        }
+    });
+
+    // Cleanup resources explicitly upon user exit
+    ws.on('close', async () => {
+        const session = activeSessions.get(sessionId);
+        if (session) {
+            clearInterval(session.streamInterval);
+            await session.browser.close();
+            activeSessions.delete(sessionId);
+            console.log(`Cleaned up resources for completed session: ${sessionId}`);
+        }
+    });
+});
+
+const PORT = 3000;
+server.listen(PORT, () => {
+    console.log(`Multi-user virtual browser hub running at http://localhost:${PORT}`);
+});
+
+// Enable experimental CDP downloads
+const client = await page.target().createCDPSession();
+await client.send('Page.setDownloadBehavior', {
+    behavior: 'allow',
+    downloadPath: path.resolve(__dirname, 'downloads', sessionId) 
+    // Saves file locally onto the server directory mapped to their unique user ID
+});
+
+// Watch file system using an NPM package like 'chokidar' to automatically 
+// stream the downloaded binary file straight over the WebSocket link to the user.
+
+npm install chokidar
+
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const puppeteer = require('puppeteer');
+const path = require('path');
+const crypto = require('crypto');
+const fs = require('fs');
+const chokidar = require('chokidar');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Ensure target directories exist
+const DOWNLOADS_BASE = path.resolve(__dirname, 'downloads');
+const PROFILES_BASE = path.resolve(__dirname, 'profiles');
+if (!fs.existsSync(DOWNLOADS_BASE)) fs.mkdirSync(DOWNLOADS_BASE);
+if (!fs.existsSync(PROFILES_BASE)) fs.mkdirSync(PROFILES_BASE);
+
+// HTTP Endpoint for local client file retrieval
+app.get('/download/:sessionId/:filename', (req, { params }, next) => {
+    const filePath = path.join(DOWNLOADS_BASE, params.sessionId, params.filename);
+    // Secure path traversal protection
+    if (!filePath.startsWith(DOWNLOADS_BASE)) return res.status(403).send('Access Denied');
+    
+    fs.existsSync(filePath) ? res.download(filePath) : res.status(404).send('File not found');
+});
+
+const activeSessions = new Map();
+
+wss.on('connection', async (ws) => {
+
+    // Session token used for persistent profile naming and isolated downloads
+    const sessionId = crypto.randomUUID();
+    const userProfileDir = path.join(PROFILES_BASE, `user-${sessionId}`);
+    const userDownloadDir = path.join(DOWNLOADS_BASE, sessionId);
+    
+    if (!fs.existsSync(userDownloadDir)) fs.mkdirSync(userDownloadDir);
+
+    console.log(`Session ${sessionId} initialized with persistent profile storage.`);
+
+    try {
+        // COOKIE PERSISTENCE: Launching with launchPersistentContext retains cookies/history on server reboots
+        const browserContext = await puppeteer.launchPersistentContext(userProfileDir, {
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1280,720']
+        });
+        
+        const page = await browserContext.newPage();
+        await page.setViewport({ width: 1280, height: 720 });
+
+        // DOWNLOAD INTERCEPTION: Attach directly to Chrome DevTools Protocol
+        const cdp = await page.target().createCDPSession();
+        await cdp.send('Page.setDownloadBehavior', {
+            behavior: 'allow',
+            downloadPath: userDownloadDir
+        });
+
+        // Watch download folder for completed file downloads
+        const watcher = chokidar.watch(userDownloadDir, { ignoreInitial: true, depth: 0 });
+        watcher.on('add', (filePath) => {
+            const filename = path.basename(filePath);
+            // Ignore temporary Chrome download extensions
+            if (filename.endsWith('.crdownload') || filename.endsWith('.tmp')) return;
+
+            // Signal frontend via WebSocket that a file is ready for pickup
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'download-ready', filename, sessionId }));
+            }
+        });
+
+        await page.goto('https://google.com');
+
+        const streamInterval = setInterval(async () => {
+            if (ws.readyState === WebSocket.OPEN) {
+                try {
+                    const screenshot = await page.screenshot({ type: 'jpeg', quality: 55 });
+                    ws.send(screenshot);
+                } catch (e) {}
+            }
+        }, 110);
+
+        activeSessions.set(sessionId, { browserContext, page, streamInterval, watcher });
+
+    } catch (err) {
+        console.error(`Session failure: ${sessionId}`, err);
+        ws.close();
+        return;
+    }
+
+    ws.on('message', async (message) => {
+        const session = activeSessions.get(sessionId);
+        if (!session) return;
+        try {
+            const data = JSON.parse(message);
+            if (data.type === 'click') await session.page.mouse.click(data.x, data.y);
+            else if (data.type === 'type') await session.page.keyboard.sendCharacter(data.key);
+            else if (data.type === 'navigate') {
+                let url = data.url;
+                if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+                await session.page.goto(url);
+            }
+        } catch (e) {}
+    });
+
+    ws.on('close', async () => {
+        const session = activeSessions.get(sessionId);
+        if (session) {
+            clearInterval(session.streamInterval);
+            session.watcher.close();
+            await session.browserContext.close();
+            activeSessions.delete(sessionId);
+            console.log(`Resources closed for session: ${sessionId}`);
+        }
+    });
+});
+
+const PORT = 3000;
+server.listen(PORT, () => console.log(`Secure Server hub online: http://localhost:${PORT}`));
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Persistent Virtual Browser Client</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #222; color: #fff; text-align: center; margin: 0; padding: 10px; }
+        #navbar { margin-bottom: 10px; display: flex; justify-content: center; gap: 10px; }
+        #urlInput { width: 50%; padding: 8px; border-radius: 4px; border: none; }
+        button { padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; background: #007bff; color: white; }
+        #browser-viewport { border: 2px solid #555; background: #000; cursor: crosshair; max-width: 100%; display: block; margin: 0 auto; }
+        #toast { position: fixed; bottom: 20px; right: 20px; background: #28a745; padding: 15px; border-radius: 5px; display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="navbar">
+        <input type="text" id="urlInput" placeholder="Type URL or download link (e.g., speed.hetzner.de)">
+        <button onclick="navigate()">Go</button>
+    </div>
+
+    <canvas id="browser-viewport" width="1280" height="720"></canvas>
+    <div id="toast">File Downloaded Successfully!</div>
+
+    <script>
+        const canvas = document.getElementById('browser-viewport');
+        const ctx = canvas.getContext('2d');
+        const urlInput = document.getElementById('urlInput');
+        const toast = document.getElementById('toast');
+        
+        const ws = new WebSocket(`ws://${window.location.host}`);
+
+        ws.onmessage = async (event) => {
+            // Check if the received frame is binary image screen stream
+            if (event.data instanceof Blob) {
+                const img = new Image();
+                img.onload = () => {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.drawImage(img, 0, 0);
+                };
+                img.src = URL.createObjectURL(event.data);
+            } else {
+                // If it is text, process application commands
+                try {
+                    const command = JSON.parse(event.data);
+                    if (command.type === 'download-ready') {
+                        triggerClientDownload(command.sessionId, command.filename);
+                    }
+                } catch(e) {}
+            }
+        };
+
+        // CLIENT DOWNLOAD TRIGGER MECHANISM
+        function triggerClientDownload(sessionId, filename) {
+            // Build temporary click anchor targeting our server download route
+            const downloadUrl = `/download/${sessionId}/${encodeURIComponent(filename)}`;
+            const link = document.createElement('a');
+            link.href = downloadUrl;
+            link.download = filename; 
+            document.body.appendChild(link);
+            link.click(); // Programmatic force click to start transfer to local machine
+            document.body.removeChild(link);
+
+            // Pop toast alert
+            toast.innerText = `Downloaded: ${filename}`;
+            toast.style.display = 'block';
+            setTimeout(() => toast.style.display = 'none', 4000);
+        }
+
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+            ws.send(JSON.stringify({ type: 'click', x: Math.round(x), y: Math.round(y) }));
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (document.activeElement === urlInput || e.key.length > 1) return;
+            ws.send(JSON.stringify({ type: 'type', key: e.key }));
+        });
+
+        function navigate() {
+            const url = urlInput.value.trim();
+            if (url) ws.send(JSON.stringify({ type: 'navigate', url }));
+        }
+    </script>
+</body>
+</html>
+
+wss.on('connection', async (ws) => {
+
+    const sessionId = crypto.randomUUID();
+    const userProfileDir = path.join(PROFILES_BASE, `user-${sessionId}`);
+    const userDownloadDir = path.join(DOWNLOADS_BASE, sessionId);
+    
+    if (!fs.existsSync(userDownloadDir)) fs.mkdirSync(userDownloadDir);
+
+    console.log(`Session ${sessionId} connected.`);
+
+    try {
+        // Upgrade flags to explicitly bypass rendering crashes and override default startup pages
+        const browserContext = await puppeteer.launchPersistentContext(userProfileDir, {
+            headless: true,
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', // Prevents shared memory crashes inside containers
+                '--disable-gpu',           // Bypasses local hardware display pipeline dependencies
+                '--no-first-run',          // Kills empty welcome walkthrough layers
+                '--no-startup-window',     // Suppresses default frozen about:blank views
+                '--window-size=1280,720',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            ]
+        });
+        
+        // RECOVERY STRATEGY: Target the pre-existing system page instead of calling context.newPage()
+        // launchPersistentContext forces 1 blank page open automatically. We must adopt it.
+        const pages = await browserContext.pages();
+        const page = pages.length > 0 ? pages[0] : await browserContext.newPage();
+        
+        await page.setViewport({ width: 1280, height: 720 });
+
+        const cdp = await page.target().createCDPSession();
+        await cdp.send('Page.setDownloadBehavior', {
+            behavior: 'allow',
+            downloadPath: userDownloadDir
+        });
+
+        const watcher = chokidar.watch(userDownloadDir, { ignoreInitial: true, depth: 0 });
+        watcher.on('add', (filePath) => {
+            const filename = path.basename(filePath);
+            if (filename.endsWith('.crdownload') || filename.endsWith('.tmp')) return;
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'download-ready', filename, sessionId }));
+            }
+        });
+
+        // Seed with explicit navigation to force-paint the canvas immediately
+        await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded' });
+
+        const streamInterval = setInterval(async () => {
+            if (ws.readyState === WebSocket.OPEN) {
+                try {
+                    const screenshot = await page.screenshot({ type: 'jpeg', quality: 55 });
+                    ws.send(screenshot);
+                } catch (e) {}
+            }
+        }, 110);
+
+        activeSessions.set(sessionId, { browserContext, page, streamInterval, watcher });
+
+    } catch (err) {
+        console.error(`Session failure on thread ${sessionId}:`, err);
+        ws.close();
+        return;
+    }
+
+    // Process inputs (Leave your existing ws.on('message') and ws.on('close') blocks exactly the same here)
+
+
